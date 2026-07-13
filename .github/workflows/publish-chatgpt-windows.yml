@@ -1,0 +1,119 @@
+name: Publish ChatGPT Windows offline package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download, verify, and package the official x64 app
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $productId = '9PLM9XGG6VKS'
+          $scriptCommit = '26510d1de601fbb76a7e124188a805abac235f64'
+          $scriptUrl = "https://raw.githubusercontent.com/1NobleCyber/Get-MSStoreDownloadLinks/$scriptCommit/Get-MSStoreDownloadLinks.ps1"
+          $work = Join-Path $env:RUNNER_TEMP 'chatgpt-windows'
+          $payload = Join-Path $work 'payload'
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+
+          $resolver = Join-Path $work 'Get-MSStoreDownloadLinks.ps1'
+          Invoke-WebRequest -Uri $scriptUrl -OutFile $resolver
+          $links = & $resolver -ProductId $productId -Architecture x64
+          if (-not $links) { throw 'Microsoft Store returned no downloadable x64 package.' }
+
+          foreach ($item in $links) {
+            if ($item.Url -notmatch '^https://[^/]*microsoft\.com/' -and
+                $item.Url -notmatch '^https://[^/]*windowsupdate\.com/') {
+              throw "Unexpected download host: $($item.Url)"
+            }
+            $destination = Join-Path $payload $item.FileName
+            Invoke-WebRequest -Uri $item.Url -OutFile $destination
+          }
+
+          $main = Get-ChildItem $payload -File | Where-Object {
+            $_.Name -match '^OpenAI\.Codex_' -and $_.Extension -in '.msix', '.msixbundle', '.appx', '.appxbundle'
+          } | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $main) { throw 'The OpenAI ChatGPT package was not found in the Microsoft payload.' }
+          if ($main.Length -lt 100MB) { throw "Package is unexpectedly small: $($main.Length) bytes" }
+
+          $signature = Get-AuthenticodeSignature $main.FullName
+          if ($signature.Status -ne 'Valid') { throw "Invalid package signature: $($signature.Status)" }
+          if ($signature.SignerCertificate.Subject -notmatch 'Microsoft|OpenAI') {
+            throw "Unexpected signer: $($signature.SignerCertificate.Subject)"
+          }
+
+          $inspect = Join-Path $work 'inspect'
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($main.FullName, $inspect)
+          [xml]$manifest = Get-Content (Join-Path $inspect 'AppxManifest.xml')
+          $version = $manifest.Package.Identity.Version
+          $publisher = $manifest.Package.Identity.Publisher
+          if (-not $version) { throw 'Could not read package version.' }
+
+          @"
+          ChatGPT for Windows (x64)
+          =========================
+
+          Official Microsoft Store product: $productId
+          Package version: $version
+          Package publisher: $publisher
+          Authenticode signer: $($signature.SignerCertificate.Subject)
+
+          Install on Windows 11:
+          1. Extract this ZIP.
+          2. Double-click the OpenAI.Codex_*.msix file.
+          3. If Windows asks for dependencies, install the included dependency packages first.
+
+          PowerShell alternative:
+          Get-ChildItem . -File | Where-Object Name -notlike 'OpenAI.Codex_*' | Where-Object Extension -in '.appx','.msix' | ForEach-Object { Add-AppxPackage $_.FullName }
+          Add-AppxPackage (Get-ChildItem 'OpenAI.Codex_*.msix' | Select-Object -First 1).FullName
+
+          This archive contains the full signed app package, not the 1.4 MB web bootstrap installer.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $payload 'INSTALL.txt')
+
+          Get-ChildItem $payload -File | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -Encoding ASCII (Join-Path $payload 'SHA256SUMS.txt')
+
+          $zipName = "ChatGPT-Windows-x64-$version-offline.zip"
+          $zipPath = Join-Path $work $zipName
+          Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $zipPath -CompressionLevel Optimal
+          $zipHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+          $tag = "chatgpt-windows-v$version"
+
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          "zip_hash=$zipHash" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP_PATH: ${{ steps.package.outputs.zip_path }}
+          ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+          ZIP_HASH: ${{ steps.package.outputs.zip_hash }}
+          VERSION: ${{ steps.package.outputs.version }}
+          TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          $notes = @"
+          Official full Windows x64 package for the unified ChatGPT desktop app (Chat, Work, and Codex).
+
+          - Microsoft Store product: `9PLM9XGG6VKS`
+          - Package version: `$env:VERSION`
+          - Archive SHA-256: `$env:ZIP_HASH`
+          - This is the complete signed MSIX payload, not the small bootstrap installer.
+          "@
+          gh release delete $env:TAG --yes 2>$null
+          git tag -d $env:TAG 2>$null
+          git push origin ":refs/tags/$env:TAG" 2>$null
+          gh release create $env:TAG $env:ZIP_PATH --title "ChatGPT Windows x64 $env:VERSION (offline package)" --notes $notes --latest
