@@ -11,7 +11,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download, verify, and package the official x64 app
         id: package
@@ -31,8 +31,12 @@ jobs:
           if (-not $links) { throw 'Microsoft Store returned no downloadable x64 package.' }
 
           foreach ($item in $links) {
-            if ($item.Url -notmatch '^https://[^/]*microsoft\.com/' -and
-                $item.Url -notmatch '^https://[^/]*windowsupdate\.com/') {
+            $downloadUri = [Uri]$item.Url
+            $allowedHosts = @(
+              'dl.delivery.mp.microsoft.com',
+              'tlu.dl.delivery.mp.microsoft.com'
+            )
+            if ($downloadUri.Scheme -notin 'http', 'https' -or $downloadUri.Host -notin $allowedHosts) {
               throw "Unexpected download host: $($item.Url)"
             }
             $destination = Join-Path $payload $item.FileName
