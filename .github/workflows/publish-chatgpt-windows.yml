@@ -43,6 +43,10 @@ jobs:
             Invoke-WebRequest -Uri $item.Url -OutFile $destination
           }
 
+          Get-ChildItem $payload -File | ForEach-Object {
+            Write-Host "Downloaded $($_.Name) ($($_.Length) bytes)"
+          }
+
           $main = Get-ChildItem $payload -File | Where-Object {
             $_.Name -match '^OpenAI\.Codex_' -and $_.Extension -in '.msix', '.msixbundle', '.appx', '.appxbundle'
           } | Sort-Object Length -Descending | Select-Object -First 1
